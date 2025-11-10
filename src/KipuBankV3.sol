@@ -2,288 +2,511 @@
 pragma solidity ^0.8.20;
 
 /**
- * @title KipuBankV3 - DeFi vault with automatic USDC conversion
+ * @title KipuBankV3 - DeFi vault with USDC normalization and direct Uniswap V2 swap
  * @author Corina Puyuelo
- * @notice This contract allows users to deposit ETH, USDC, or any ERC20 token supported by Uniswap V2.
- * All non-USDC tokens are automatically swapped to USDC using the Uniswap V2 router.
- * The contract maintains all internal accounting in USDC (6 decimals), enforcing a global USD-denominated cap.
- * @dev Implements CEI (Checks-Effects-Interactions) pattern, uses Ownable access control,
- * integrates Chainlink Data Feeds for price validation, and minimizes gas by reducing storage access.
+ * @notice This contract allows users to deposit ETH, USDC, or any ERC-20 token that has a direct USDC pair on Uniswap V2.
+ * Every non-USDC asset is immediately converted into USDC and the internal accounting is kept in 6-decimal USDC.
+ * If the incoming token does not have a direct USDC pool on Uniswap V2, the transaction reverts to preserve the vault invariant.
+ * @dev This is a self-contained version for Remix: it inlines minimal Ownable, ReentrancyGuard, ERC-20, Chainlink and Uniswap interfaces.
+ * Uses CEI pattern, enforces a global USDC-denominated cap, and exposes admin functions to adjust limits.
  */
 
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+/*//////////////////////////////////////////////////////////////
+                        MINIMAL INTERFACES
+//////////////////////////////////////////////////////////////*/
 
-/// @notice Minimal interface for Uniswap V2 Router (only required swap methods)
-interface IUniswapV2Router02 {
-    function WETH() external pure returns (address);
-    function swapExactETHForTokens(
-        uint amountOutMin,
-        address[] calldata path,
-        address to,
-        uint deadline
-    ) external payable returns (uint[] memory amounts);
-    function swapExactTokensForTokens(
-        uint amountIn,
-        uint amountOutMin,
-        address[] calldata path,
-        address to,
-        uint deadline
-    ) external returns (uint[] memory amounts);
+/**
+ * @dev Minimal ERC-20 interface used for transfers and allowances.
+ */
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 value) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 value) external returns (bool);
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
 }
 
-contract KipuBankV3 is Ownable {
+/**
+ * @dev Minimal WETH interface: ERC-20 + deposit() to wrap ETH.
+ */
+interface IWETH is IERC20 {
+    function deposit() external payable;
+}
 
-    // ============ VARIABLES ============
+/**
+ * @dev Minimal Uniswap V2 router interface, only used to read WETH and factory.
+ */
+interface IUniswapV2Router02 {
+    function WETH() external pure returns (address);
+    function factory() external pure returns (address);
+}
 
-    /// @notice Maximum total value (in USD, 6 decimals like USDC) the bank may hold.
-    uint256 public immutable bankCapUSD;
+/**
+ * @dev Minimal Uniswap V2 factory interface, used to get the pair for tokenIn-tokenOut.
+ */
+interface IUniswapV2Factory {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
 
-    /// @notice Per-transaction withdrawal limit, denominated in USDC (6 decimals).
-    uint256 public immutable withdrawalLimit;
+/**
+ * @dev Minimal Uniswap V2 pair interface, used to read reserves and execute the swap.
+ */
+interface IUniswapV2Pair {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function swap(uint amount0Out, uint amount1Out, address to, bytes calldata data) external;
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+}
 
-    /// @notice Address of the USDC token contract.
-    address public immutable usdc;
+/**
+ * @dev Trimmed Chainlink AggregatorV3Interface, used only for price reads.
+ */
+interface AggregatorV3Interface {
+    function latestRoundData()
+        external
+        view
+        returns (
+            uint80 roundId,
+            int256 answer,
+            uint256 startedAt,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        );
+}
 
-    /// @notice Instance of the Uniswap V2 router used for token swaps.
-    IUniswapV2Router02 public immutable router;
+/*//////////////////////////////////////////////////////////////
+                        MINIMAL OWNABLE
+//////////////////////////////////////////////////////////////*/
 
-    /// @notice Chainlink ETH/USD price feed used to enforce USD-denominated cap.
-    AggregatorV3Interface public immutable priceFeed;
+/**
+ * @title Ownable (minimal)
+ * @notice Basic access control: a single account (the owner) can perform admin actions.
+ * @dev Owner is passed explicitly in the child contract constructor.
+ */
+abstract contract Ownable {
+    /// @notice Current contract owner.
+    address private _owner;
 
-    /// @notice Mapping of user address to their vault balance (in USDC).
-    mapping(address => uint256) private balances;
-
-    /// @notice Number of deposits per user (for tracking activity).
-    mapping(address => uint256) public depositCount;
-
-    /// @notice Number of withdrawals per user (for tracking activity).
-    mapping(address => uint256) public withdrawalCount;
-
-    /// @notice Total USDC currently deposited in the bank.
-    uint256 public totalDeposits;
-
-    /// @notice Reentrancy guard flag (1 = unlocked, 2 = locked).
-    uint256 private _locked = 1;
-
-    // ============ EVENTS ============
-
-    /// @notice Emitted when a user deposits USDC into the bank.
-    /// @param user Address of the depositor.
-    /// @param amountUSDC Amount of USDC credited.
-    event Deposit(address indexed user, uint256 amountUSDC);
-
-    /// @notice Emitted when a user withdraws USDC from the bank.
-    /// @param user Address of the withdrawer.
-    /// @param amountUSDC Amount of USDC withdrawn.
-    event Withdrawal(address indexed user, uint256 amountUSDC);
-
-    /// @notice Emitted when a token is swapped to USDC via Uniswap.
-    /// @param user Address initiating the swap.
-    /// @param tokenIn Token address being swapped.
-    /// @param amountIn Amount of input token.
-    /// @param amountOutUSDC Resulting USDC received.
-    event TokenSwapped(address indexed user, address tokenIn, uint256 amountIn, uint256 amountOutUSDC);
-
-    // ============ ERRORS ============
-
-    /// @notice Thrown when a function receives a zero amount.
-    error ZeroAmount();
-
-    /// @notice Thrown when total bank deposits would exceed the USD-denominated cap.
-    error BankCapExceeded();
-
-    /// @notice Thrown when a user tries to withdraw more than the allowed per-transaction limit.
-    error ExceedsWithdrawalLimit();
-
-    /// @notice Thrown when a user attempts to withdraw more than their balance.
-    error InsufficientBalance();
-
-    /// @notice Thrown when an ERC20 or native transfer fails.
-    error TransferFailed();
-
-    /// @notice Thrown when invalid constructor parameters are provided.
-    error InvalidParams();
-
-    /// @notice Thrown when a reentrancy attempt is detected.
-    error Reentrancy();
-
-    // ============ MODIFIERS ============
-
-    /// @notice Ensures that an amount parameter is non-zero.
-    /// @param _amount The amount to validate.
-    modifier nonZero(uint256 _amount) {
-        if (_amount == 0) revert ZeroAmount();
-        _;
-    }
-
-    /// @notice Simple reentrancy protection mechanism.
-    modifier nonReentrant() {
-        if (_locked != 1) revert Reentrancy();
-        _locked = 2;
-        _;
-        _locked = 1;
-    }
-
-    // ============ CONSTRUCTOR ============
+    /// @notice Emitted when ownership is transferred.
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
     /**
-     * @notice Deploys the KipuBankV3 contract.
-     * @param _bankCapUSD Global bank cap in USD (6 decimals, same as USDC).
-     * @param _withdrawalLimit Maximum per-transaction withdrawal limit (in USDC).
-     * @param _router Address of the Uniswap V2 router.
-     * @param _usdc Address of the USDC token contract.
+     * @notice Initializes the contract setting the deployer (or given address) as the initial owner.
+     * @param initialOwner Address that will be granted admin privileges.
+     */
+    constructor(address initialOwner) {
+        require(initialOwner != address(0), "Owner zero");
+        _owner = initialOwner;
+        emit OwnershipTransferred(address(0), initialOwner);
+    }
+
+    /**
+     * @notice Restricts a function to the current owner.
+     */
+    modifier onlyOwner() {
+        require(msg.sender == _owner, "Not owner");
+        _;
+    }
+
+    /**
+     * @notice Returns the current owner.
+     */
+    function owner() public view returns (address) {
+        return _owner;
+    }
+
+    /**
+     * @notice Transfers ownership to a new address.
+     * @param newOwner Address of the new owner.
+     */
+    function transferOwnership(address newOwner) public onlyOwner {
+        require(newOwner != address(0), "Owner zero");
+        emit OwnershipTransferred(_owner, newOwner);
+        _owner = newOwner;
+    }
+}
+
+/*//////////////////////////////////////////////////////////////
+                    MINIMAL REENTRANCY GUARD
+//////////////////////////////////////////////////////////////*/
+
+/**
+ * @title ReentrancyGuard (minimal)
+ * @notice Protects sensitive functions from reentrant calls.
+ * @dev Classic two-state pattern.
+ */
+abstract contract ReentrancyGuard {
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+
+    /// @dev Reentrancy status
+    uint256 private _status;
+
+    constructor() {
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @notice Prevents a contract from calling itself, directly or indirectly.
+     */
+    modifier nonReentrant() {
+        require(_status != _ENTERED, "Reentrancy");
+        _status = _ENTERED;
+        _;
+        _status = _NOT_ENTERED;
+    }
+}
+
+/*//////////////////////////////////////////////////////////////
+                        KIPUBANK V3
+//////////////////////////////////////////////////////////////*/
+
+/**
+ * @title KipuBankV3
+ * @notice DeFi vault that normalizes all incoming assets to USDC and keeps a global cap.
+ * @dev Uses direct Uniswap V2 pair swaps (not router swaps) to reduce gas.
+ * If no direct token→USDC pair exists, the transaction reverts.
+ */
+contract KipuBankV3 is Ownable, ReentrancyGuard {
+
+    /*//////////////////////////////////////////////////////////////
+                            VARIABLES
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Uniswap V2 router, used only to read WETH and factory.
+    IUniswapV2Router02 public immutable router;
+
+    /// @notice Uniswap V2 factory, used to fetch token→USDC pairs.
+    IUniswapV2Factory public immutable factory;
+
+    /// @notice USDC token (6 decimals) used as the internal accounting unit.
+    IERC20 public immutable usdc;
+
+    /// @notice WETH token for this network, used to wrap incoming ETH.
+    IWETH public immutable weth;
+
+    /// @notice Chainlink ETH/USD price feed (kept for external price reads).
+    AggregatorV3Interface public immutable priceFeed;
+
+    /// @notice Global vault cap in USDC (6 decimals). Total USDC in the vault cannot exceed this.
+    uint256 public bankCapUSD;
+
+    /// @notice Per-transaction withdrawal limit in USDC (6 decimals).
+    uint256 public withdrawalLimit;
+
+    /// @notice Total amount of USDC currently accounted in the vault.
+    uint256 public totalUSDC;
+
+    /// @notice Mapping of user address to their USDC-denominated balance.
+    mapping(address => uint256) public balances;
+
+    /*//////////////////////////////////////////////////////////////
+                                EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Emitted whenever a deposit is credited to a user.
+     * @param user Address of the depositor.
+     * @param amountUSDC Amount of USDC credited (6 decimals).
+     */
+    event Deposit(address indexed user, uint256 amountUSDC);
+
+    /**
+     * @notice Emitted whenever a withdrawal is performed.
+     * @param user Address of the withdrawer.
+     * @param amountUSDC Amount of USDC withdrawn.
+     */
+    event Withdrawal(address indexed user, uint256 amountUSDC);
+
+    /**
+     * @notice Emitted whenever a token is swapped to USDC through a Uniswap V2 pair.
+     * @param user Address that initiated the swap (the depositor).
+     * @param tokenIn Address of the input token.
+     * @param amountIn Amount of input tokens sent to the pair.
+     * @param amountUSDCOut Amount of USDC received from the swap.
+     */
+    event TokenSwapped(address indexed user, address indexed tokenIn, uint256 amountIn, uint256 amountUSDCOut);
+
+    /**
+     * @notice Emitted when the global bank cap is updated.
+     * @param newCapUSDC New cap value in USDC.
+     */
+    event BankCapUpdated(uint256 newCapUSDC);
+
+    /**
+     * @notice Emitted when the per-transaction withdrawal limit is updated.
+     * @param newLimitUSDC New per-transaction withdrawal limit in USDC.
+     */
+    event WithdrawalLimitUpdated(uint256 newLimitUSDC);
+
+
+    /*//////////////////////////////////////////////////////////////
+                                ERRORS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Thrown when a function is called with a zero amount.
+    error ZeroAmount();
+
+    /// @notice Thrown when an ERC-20 transfer or pair transfer fails.
+    error TransferFailed();
+
+    /// @notice Thrown when a deposit would push the vault over its global USDC cap.
+    error CapExceeded();
+
+    /// @notice Thrown when a withdrawal exceeds the per-transaction limit.
+    error WithdrawalLimitExceeded();
+
+    /// @notice Thrown when there is no direct token→USDC Uniswap V2 pair for the token being deposited.
+    error NoDirectUSDCPath();
+
+
+    /*//////////////////////////////////////////////////////////////
+                                MODIFIERS
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Ensures that the provided amount is greater than zero.
+     * @param amount Amount to validate.
+     */
+    modifier nonZero(uint256 amount) {
+        if (amount == 0) revert ZeroAmount();
+        _;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                                CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Deploys the vault with all core dependencies.
+     * @param initialOwner Address that will be set as the contract owner.
+     * @param _bankCapUSD Global bank cap in USDC (6 decimals).
+     * @param _withdrawalLimit Per-transaction withdrawal limit in USDC (6 decimals).
+     * @param _router Address of the Uniswap V2 router (to read WETH and factory).
+     * @param _usdc Address of the USDC token.
      * @param _priceFeed Address of the Chainlink ETH/USD price feed.
      */
     constructor(
+        address initialOwner,
         uint256 _bankCapUSD,
         uint256 _withdrawalLimit,
         address _router,
         address _usdc,
         address _priceFeed
-    ) {
-        if (
-            _bankCapUSD == 0 ||
-            _withdrawalLimit == 0 ||
-            _router == address(0) ||
-            _usdc == address(0) ||
-            _priceFeed == address(0)
-        ) revert InvalidParams();
+    )
+        Ownable(initialOwner)
+    {
+        require(_router != address(0), "router zero");
+        require(_usdc != address(0), "usdc zero");
+        require(_priceFeed != address(0), "priceFeed zero");
+
+        router = IUniswapV2Router02(_router);
+        factory = IUniswapV2Factory(IUniswapV2Router02(_router).factory());
+        usdc = IERC20(_usdc);
+        weth = IWETH(IUniswapV2Router02(_router).WETH());
+        priceFeed = AggregatorV3Interface(_priceFeed);
 
         bankCapUSD = _bankCapUSD;
         withdrawalLimit = _withdrawalLimit;
-        router = IUniswapV2Router02(_router);
-        usdc = _usdc;
-        priceFeed = AggregatorV3Interface(_priceFeed);
     }
 
-    // ============ FUNCTIONS ============
+    /*//////////////////////////////////////////////////////////////
+                            FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Allows a user to deposit native ETH, which is automatically swapped to USDC.
-     * @dev Uses Uniswap V2's swapExactETHForTokens. Emits TokenSwapped and Deposit.
+     * @notice Deposits native ETH into the vault.
+     * @dev ETH is wrapped to WETH, then swapped directly WETH→USDC through the pair.
+     * Reverts if no WETH/USDC pair exists.
      */
     function depositETH() external payable nonZero(msg.value) nonReentrant {
-        address ;
-        path[0] = router.WETH();
-        path[1] = usdc;
-
-        uint[] memory amounts = router.swapExactETHForTokens{value: msg.value}(
-            0, path, address(this), block.timestamp
-        );
-        uint256 usdcOut = amounts[1];
-        emit TokenSwapped(msg.sender, path[0], msg.value, usdcOut);
-
-        _handleDeposit(msg.sender, usdcOut);
+        _handleETHDeposit(msg.sender, msg.value);
     }
 
     /**
-     * @notice Deposits USDC directly without swaps.
+     * @notice Internal handler for ETH deposits, used by both depositETH() and receive().
+     * @param depositor Address to credit.
+     * @param amount Amount of ETH sent.
+     */
+    function _handleETHDeposit(address depositor, uint256 amount) internal {
+        // wrap ETH
+        weth.deposit{value: amount}();
+
+        // swap WETH → USDC (must exist)
+        uint256 usdcOut = _swapDirect(address(weth), address(usdc), amount);
+
+        emit TokenSwapped(depositor, address(weth), amount, usdcOut);
+
+        // credit user
+        _handleDeposit(depositor, usdcOut);
+    }
+
+    /**
+     * @notice Deposits USDC directly into the vault.
      * @param amount Amount of USDC to deposit (6 decimals).
      */
-    function depositUSDC(uint256 amount) external nonZero(amount) nonReentrant {
-        bool ok = IERC20(usdc).transferFrom(msg.sender, address(this), amount);
+    function depositUSDC(uint256 amount) public nonZero(amount) nonReentrant {
+        bool ok = usdc.transferFrom(msg.sender, address(this), amount);
         if (!ok) revert TransferFailed();
         _handleDeposit(msg.sender, amount);
     }
 
     /**
-     * @notice Deposits any ERC20 token supported by Uniswap V2 and converts it to USDC.
-     * @param token Address of the ERC20 token to deposit.
-     * @param amount Amount of token to deposit.
+     * @notice Deposits any ERC-20 supported by a direct USDC pair in Uniswap V2.
+     * @dev If the token is already USDC, it is forwarded to depositUSDC().
+     * If there is no direct token→USDC pair, reverts.
+     * @param token ERC-20 token address to deposit.
+     * @param amount Amount of the token to deposit.
      */
     function depositToken(address token, uint256 amount) external nonZero(amount) nonReentrant {
-        if (token == usdc) {
+        // shortcut for USDC
+        if (token == address(usdc)) {
             depositUSDC(amount);
             return;
         }
 
+        // pull tokens into this contract
         bool ok = IERC20(token).transferFrom(msg.sender, address(this), amount);
         if (!ok) revert TransferFailed();
 
-        IERC20(token).approve(address(router), amount);
+        // swap token → USDC through the direct pair (or revert)
+        uint256 usdcOut = _swapDirect(token, address(usdc), amount);
 
-        address ;
-        path[0] = token;
-        path[1] = usdc;
-
-        uint[] memory amounts = router.swapExactTokensForTokens(
-            amount, 0, path, address(this), block.timestamp
-        );
-        uint256 usdcOut = amounts[1];
         emit TokenSwapped(msg.sender, token, amount, usdcOut);
 
         _handleDeposit(msg.sender, usdcOut);
     }
 
     /**
-     * @notice Withdraws USDC up to the per-transaction limit.
-     * @param amount Amount of USDC to withdraw.
+     * @notice Withdraws USDC from the caller's balance.
+     * @dev Enforces per-tx withdrawal limit and balance sufficiency.
+     * @param amount Amount of USDC (6 decimals) to withdraw.
      */
     function withdraw(uint256 amount) external nonZero(amount) nonReentrant {
-        uint256 userBalance = balances[msg.sender];
-        if (amount > userBalance) revert InsufficientBalance();
-        if (amount > withdrawalLimit) revert ExceedsWithdrawalLimit();
+        if (amount > withdrawalLimit) revert WithdrawalLimitExceeded();
 
-        balances[msg.sender] = userBalance - amount;
+        uint256 bal = balances[msg.sender];
+        require(bal >= amount, "insufficient balance");
+
+        // effects
         unchecked {
-            totalDeposits -= amount;
-            withdrawalCount[msg.sender]++;
+            balances[msg.sender] = bal - amount;
+            totalUSDC -= amount;
         }
 
-        bool ok = IERC20(usdc).transfer(msg.sender, amount);
+        // interaction
+        bool ok = usdc.transfer(msg.sender, amount);
         if (!ok) revert TransferFailed();
 
         emit Withdrawal(msg.sender, amount);
     }
 
     /**
-     * @notice Returns the USDC balance of a user.
-     * @param user Address to query.
-     * @return balance User balance in USDC.
+     * @notice Common internal deposit logic: enforces cap, updates storage, emits event.
+     * @param user Address to credit.
+     * @param amountUSDC Amount of USDC to credit.
      */
-    function getBalance(address user) external view returns (uint256 balance) {
-        return balances[user];
-    }
+    function _handleDeposit(address user, uint256 amountUSDC) internal {
+        uint256 newTotal = totalUSDC + amountUSDC;
+        if (newTotal > bankCapUSD) revert CapExceeded();
 
-    /**
-     * @notice Handles the internal logic of crediting user balances.
-     * @dev Enforces the bank cap in USD before updating storage.
-     * @param user Address of the depositor.
-     * @param amountUSDC Amount of USDC credited.
-     */
-    function _handleDeposit(address user, uint256 amountUSDC) private {
-        uint256 newTotal = totalDeposits + amountUSDC;
-        if (_exceedsCapInUSD(newTotal)) revert BankCapExceeded();
-
+        totalUSDC = newTotal;
         balances[user] += amountUSDC;
-        unchecked { depositCount[user]++; }
-        totalDeposits = newTotal;
 
         emit Deposit(user, amountUSDC);
     }
 
     /**
-     * @notice Compares the total deposits (in USDC) to the USD-denominated bank cap.
-     * @dev Uses Chainlink ETH/USD feed for normalization (feed 8 decimals → USDC 6 decimals).
-     * @param newTotalUSDC The new total USDC balance after deposit.
-     * @return exceeded True if the new total exceeds the allowed USD cap.
+     * @notice Performs a direct Uniswap V2 pair swap (tokenIn → tokenOut).
+     * @dev This contract assumes a 0.3% fee pair (997/1000). If the pair does not exist, reverts.
+     * @param tokenIn Token to send to the pair.
+     * @param tokenOut Token to receive from the pair (USDC in our use case).
+     * @param amountIn Amount of tokenIn to swap.
+     * @return amountOut Amount of tokenOut received.
      */
-    function _exceedsCapInUSD(uint256 newTotalUSDC) private view returns (bool exceeded) {
-        (, int256 ethUsd,,,) = priceFeed.latestRoundData();
-        require(ethUsd > 0, "Invalid oracle price");
+    function _swapDirect(address tokenIn, address tokenOut, uint256 amountIn) internal returns (uint256 amountOut) {
+        // fetch the pair
+        address pair = factory.getPair(tokenIn, tokenOut);
+        if (pair == address(0)) revert NoDirectUSDCPath();
 
-        // Normalize between 8-decimal price feed and 6-decimal USDC
-        uint256 capUSDC = (bankCapUSD * 1e8) / uint256(ethUsd);
-        return newTotalUSDC > capUSDC;
+        // read reserves
+        (uint112 reserve0, uint112 reserve1,) = IUniswapV2Pair(pair).getReserves();
+        address token0 = IUniswapV2Pair(pair).token0();
+        address token1 = IUniswapV2Pair(pair).token1();
+
+        // send tokenIn to the pair
+        bool ok = IERC20(tokenIn).transfer(pair, amountIn);
+        if (!ok) revert TransferFailed();
+
+        // compute amountOut using Uniswap V2 formula
+        if (tokenIn == token0) {
+            // tokenIn is token0 → we output token1
+            uint256 amountInWithFee = amountIn * 997;
+            uint256 numerator = amountInWithFee * reserve1;
+            uint256 denominator = uint256(reserve0) * 1000 + amountInWithFee;
+            amountOut = numerator / denominator;
+
+            IUniswapV2Pair(pair).swap(0, amountOut, address(this), "");
+        } else if (tokenIn == token1) {
+            // tokenIn is token1 → we output token0
+            uint256 amountInWithFee = amountIn * 997;
+            uint256 numerator = amountInWithFee * reserve0;
+            uint256 denominator = uint256(reserve1) * 1000 + amountInWithFee;
+            amountOut = numerator / denominator;
+
+            IUniswapV2Pair(pair).swap(amountOut, 0, address(this), "");
+        } else {
+            // safety: tokenIn must be one of the two tokens in the pair
+            revert NoDirectUSDCPath();
+        }
     }
 
     /**
-     * @notice Fallback to receive ETH directly.
-     * @dev Automatically routes ETH deposits through depositETH().
+     * @notice Updates the global USDC-denominated cap.
+     * @dev Only callable by the owner.
+     * @param newCapUSDC New global cap, in USDC (6 decimals).
+     */
+    function setBankCap(uint256 newCapUSDC) external onlyOwner {
+        bankCapUSD = newCapUSDC;
+        emit BankCapUpdated(newCapUSDC);
+    }
+
+    /**
+     * @notice Updates the per-transaction withdrawal limit.
+     * @dev Only callable by the owner.
+     * @param newLimitUSDC New per-tx withdrawal limit, in USDC (6 decimals).
+     */
+    function setWithdrawalLimit(uint256 newLimitUSDC) external onlyOwner {
+        withdrawalLimit = newLimitUSDC;
+        emit WithdrawalLimitUpdated(newLimitUSDC);
+    }
+
+    /**
+     * @notice Returns the USDC balance of a given account.
+     * @param user Address to query.
+     * @return balanceUSDC USDC balance (6 decimals).
+     */
+    function getBalance(address user) external view returns (uint256 balanceUSDC) {
+        return balances[user];
+    }
+
+    /**
+     * @notice Returns the latest ETH/USD price from Chainlink.
+     * @dev Returned value has the decimals defined by the specific feed (commonly 8).
+     */
+    function getLatestETHPrice() external view returns (int256) {
+        (, int256 price,,,) = priceFeed.latestRoundData();
+        return price;
+    }
+
+    /**
+     * @notice Allows sending ETH directly to the contract and treats it as a deposit.
+     * @dev Calls the internal ETH deposit handler to keep logic DRY.
      */
     receive() external payable {
-        depositETH();
+        if (msg.value > 0) {
+            _handleETHDeposit(msg.sender, msg.value);
+        }
     }
 }
