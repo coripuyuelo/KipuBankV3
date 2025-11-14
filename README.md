@@ -104,6 +104,12 @@ forge create src/KipuBankV3.sol:KipuBankV3 \
 
 ### Verify
 After deployment, verify the contract on Etherscan / Routescan / Blockscout.
+```bash
+forge create src/KipuBankV3.sol:KipuBankV3 \
+  --rpc-url $SEPOLIA_RPC \
+  --private-key $PRIVATE_KEY \
+  --constructor-args 25000000000000000000000 1000000000000000000 $UNISWAP_ROUTER $USDC_ADDRESS
+```
 
 **Verified contract URL:** `https://...`
 
