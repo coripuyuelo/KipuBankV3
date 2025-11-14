@@ -86,7 +86,7 @@ All balances inside the bank are in USDC.
 ### Requirements
 - **Foundry** (`forge`)  
 - Wallet with test ETH and USDC  
-- Uniswap V2 router address (Sepolia or target network)  
+- Uniswap V2 router address (Sepolia network)  
 - USDC token address
 
 ### Compile
