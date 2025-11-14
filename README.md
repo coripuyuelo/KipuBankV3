@@ -46,8 +46,6 @@ This project is part of Module 4 of the **Ethereum Developer Pack – Fundación
    - Withdrawals, events, and errors preserved.  
    - Ownership logic (if present in V2) maintained.  
 
-> *Note: If KipuBankV2 included an owner/admin role, it should be preserved in V3. This repository assumes the same access-control model.*
-
 ---
 
 ## 3. Contract architecture
